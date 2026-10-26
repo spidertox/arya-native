@@ -55,20 +55,23 @@ jobs:
         with:
           gradle-version: "8.14.3"
 
+      # Without a real signing key, debug builds are signed with a debug key. A fresh runner would invent a new one
+      # every run, and Android refuses to update an app whose signature changed. Caching the key keeps it stable.
+      - name: Keep a stable debug signing key
+        if: env.HAS_SIGNING_KEY != 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: arya-debug-keystore-v1
+
       - name: Debug APK
         run: gradle :app:assembleDebug --no-daemon --stacktrace
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: Arya-debug-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
-          if-no-files-found: error
 
       - name: Lint (informational)
         run: gradle :app:lintDebug --no-daemon
         continue-on-error: true
 
-      # ---- signed release build for Google Play (only when signing secrets exist) -----------------
+      # ---- signed release build (only when the signing secrets exist; see docs/SIGNING.md) ---------
       - name: Decode upload keystore
         id: keystore
         if: env.HAS_SIGNING_KEY == 'true'
@@ -87,22 +90,66 @@ jobs:
           ARYA_KEY_PASSWORD: ${{ secrets.ARYA_KEY_PASSWORD }}
         run: gradle :app:bundleRelease :app:assembleRelease --no-daemon --stacktrace
 
-      - name: Upload release artifacts
-        if: env.HAS_SIGNING_KEY == 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: Arya-release
-          path: |
-            app/build/outputs/bundle/release/app-release.aab
-            app/build/outputs/apk/release/app-release.apk
+      # ---- collect the files that end up in the GitHub Release -----------------------------------
+      - name: Name the build files
+        run: |
+          set -eu
+          case "$GITHUB_REF" in
+            refs/tags/v*) LABEL="$GITHUB_REF_NAME" ;;
+            *)            LABEL="nightly" ;;
+          esac
+          mkdir -p dist
+          if [ "${HAS_SIGNING_KEY}" = "true" ]; then
+            cp app/build/outputs/apk/release/app-release.apk "dist/Arya-${LABEL}.apk"
+            cp app/build/outputs/bundle/release/app-release.aab "dist/Arya-${LABEL}.aab"
+          else
+            cp app/build/outputs/apk/debug/app-debug.apk "dist/Arya-${LABEL}-debug.apk"
+          fi
+          ls -la dist
 
-      - name: Attach to GitHub Release (tags only)
-        if: startsWith(github.ref, 'refs/tags/v') && env.HAS_SIGNING_KEY == 'true'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Arya-build
+          path: dist/*
+          if-no-files-found: error
+
+      # ---- publish to Releases -------------------------------------------------------------------
+      # Every push to main refreshes one rolling pre-release called "nightly"; no tagging needed.
+      - name: Move the nightly tag to this commit
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -f nightly
+          git push -f origin refs/tags/nightly
+
+      - name: Publish the nightly release
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            app/build/outputs/apk/release/app-release.apk
-            app/build/outputs/bundle/release/app-release.aab
+          tag_name: nightly
+          name: Arya nightly (build ${{ github.run_number }})
+          prerelease: true
+          make_latest: "false"
+          files: dist/*
+          body: |
+            Automatic build of commit `${{ github.sha }}` from `main`.
+
+            **Install:** download the `.apk` below, open it on your phone and allow "install unknown apps" when asked.
+            Builds from the same signing key update each other in place; if Android says the app conflicts with an
+            existing one, uninstall the old Arya first.
+
+            Early software: please report problems in Issues.
+
+      # Pushing a tag such as v0.2.0 publishes a normal, numbered release with generated notes.
+      - name: Publish a versioned release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Arya ${{ github.ref_name }}
+          generate_release_notes: true
+          prerelease: false
+          files: dist/*
 
       # If anything above failed, keep the Gradle/Kotlin/lint reports so the real error is easy to read.
       - name: Upload build reports on failure
